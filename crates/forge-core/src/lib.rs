@@ -212,6 +212,8 @@ struct Snapshot {
     aof_offset: u64,
     jobs: HashMap<String, Job>,
     history: HashMap<String, Vec<HistoryEntry>>,
+    #[serde(default)]
+    dead_jobs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,10 +351,10 @@ impl Queue {
             AppendOnlyLog::open_with_sync(data_dir.join("forge.aof"), sync_mode.into_policy()?)?;
 
         // Recover from snapshot + AOF
-        let (mut jobs, mut history, offset) = read_snapshot(&data_dir)?.unwrap_or_default();
+        let (mut jobs, mut history, mut dead_jobs, offset) =
+            read_snapshot(&data_dir)?.unwrap_or_default();
         let events = log.replay_from(offset)?;
         let mut pending = BinaryHeap::new();
-        let mut dead_jobs = Vec::new();
 
         for event in &events {
             apply_event(&mut jobs, &mut history, &mut pending, &mut dead_jobs, event);
@@ -564,6 +566,12 @@ impl Queue {
                 .jobs
                 .get_mut(job_id)
                 .ok_or_else(|| ForgeError::JobNotFound(job_id.to_string()))?;
+            if job.status != JobStatus::Claimed {
+                return Err(ForgeError::JobNotFound(format!(
+                    "job {job_id} is not claimed (status: {:?})",
+                    job.status
+                )));
+            }
             job.status = JobStatus::Succeeded;
             job.completed_at = Some(now);
             (job.id.clone(), job.attempt)
@@ -603,6 +611,12 @@ impl Queue {
                 .jobs
                 .get_mut(job_id)
                 .ok_or_else(|| ForgeError::JobNotFound(job_id.to_string()))?;
+            if job.status != JobStatus::Claimed {
+                return Err(ForgeError::JobNotFound(format!(
+                    "job {job_id} is not claimed (status: {:?})",
+                    job.status
+                )));
+            }
             let jid = job.id.clone();
             let attempt = job.attempt;
             let max_attempts = job.max_attempts;
@@ -799,22 +813,16 @@ impl Queue {
         let mut inner = self.inner.lock().expect("inner lock poisoned");
         inner.log.flush()?;
 
+        inner.log.truncate()?;
         let snapshot = Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
             created_at: Utc::now(),
-            aof_offset: inner.log.len()?,
+            aof_offset: 0,
             jobs: inner.jobs.clone(),
             history: inner.history.clone(),
+            dead_jobs: inner.dead_jobs.clone(),
         };
         write_snapshot(&self.data_dir, &snapshot)?;
-        inner.log.truncate()?;
-        write_snapshot(
-            &self.data_dir,
-            &Snapshot {
-                aof_offset: 0,
-                ..snapshot
-            },
-        )?;
         Ok(())
     }
 
@@ -824,9 +832,7 @@ impl Queue {
 
     pub fn doctor(&self) -> Result<DoctorReport, ForgeError> {
         let snapshot_exists = self.data_dir.join("forge.snapshot").exists();
-        let _ = read_snapshot(&self.data_dir)?;
         let inner = self.inner.lock().expect("inner lock poisoned");
-        let _ = inner.log.replay_from(0)?;
         let aof_bytes = inner.log.len()?;
         let queued = inner
             .jobs
@@ -1078,6 +1084,7 @@ fn snapshot_path(data_dir: &Path) -> PathBuf {
 type SnapshotData = (
     HashMap<String, Job>,
     HashMap<String, Vec<HistoryEntry>>,
+    Vec<String>,
     u64,
 );
 
@@ -1101,7 +1108,12 @@ fn read_snapshot(data_dir: &Path) -> Result<Option<SnapshotData>, ForgeError> {
     if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
         return Err(ForgeError::UnsupportedSnapshot(snapshot.format_version));
     }
-    Ok(Some((snapshot.jobs, snapshot.history, snapshot.aof_offset)))
+    Ok(Some((
+        snapshot.jobs,
+        snapshot.history,
+        snapshot.dead_jobs,
+        snapshot.aof_offset,
+    )))
 }
 
 fn looks_like_snapshot_envelope(value: &serde_json::Value) -> bool {
@@ -1378,6 +1390,46 @@ mod tests {
         let report = queue.doctor().unwrap();
         assert!(report.ok);
         assert!(report.aof_bytes > 0);
+    }
+
+    #[test]
+    fn acknowledge_rejects_non_claimed() {
+        let dir = TempDir::new().unwrap();
+        let queue = Queue::open(dir.path()).unwrap();
+        let id = queue.push("t", "{}", 0, 0).unwrap();
+        // Can't ack a job that hasn't been claimed
+        match queue.acknowledge(&id) {
+            Err(ForgeError::JobNotFound(_)) => {}
+            other => panic!("expected JobNotFound, got {other:?}"),
+        }
+        // Can't fail a job that hasn't been claimed
+        match queue.fail(&id, "nope") {
+            Err(ForgeError::JobNotFound(_)) => {}
+            other => panic!("expected JobNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dead_list_survives_compaction() {
+        let dir = TempDir::new().unwrap();
+        let queue = Queue::open(dir.path()).unwrap();
+        let id = queue.push_with_attempts("t", "{}", 0, 0, 1).unwrap();
+        let _job = queue.claim().unwrap();
+        queue.fail(&id, "dead").unwrap();
+        assert_eq!(queue.dead_list().unwrap().len(), 1);
+        queue.compact().unwrap();
+        assert_eq!(
+            queue.dead_list().unwrap().len(),
+            1,
+            "dead list must survive compaction"
+        );
+        drop(queue);
+        let queue = Queue::open(dir.path()).unwrap();
+        assert_eq!(
+            queue.dead_list().unwrap().len(),
+            1,
+            "dead list must survive reopen from snapshot"
+        );
     }
 
     #[test]

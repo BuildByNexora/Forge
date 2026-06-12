@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "forge"
+name = "forge-queue"
 version = "0.1.0"
 description = "Embedded-first job queue for Python, powered by Rust"
 readme = "README.md"
