@@ -1,0 +1,10 @@
+/target
+__pycache__
+*.pyc
+*.pyo
+.venv
+forge.egg-info
+dist
+*.so
+*.dylib
+*.dll
